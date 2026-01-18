@@ -74,7 +74,7 @@ static string PromptDurationUnit()
 
 static DateTime CalculateExpiryUtc(DateTime issuedAtUtc, string unit, int value)
 {
-    DateTime expiry = unit switch
+    var expiry = unit switch
     {
         "days" => issuedAtUtc.AddDays(value),
         "months" => issuedAtUtc.AddMonths(value),
@@ -85,7 +85,6 @@ static DateTime CalculateExpiryUtc(DateTime issuedAtUtc, string unit, int value)
     // End-of-day UTC
     return expiry.Date.AddDays(1).AddSeconds(-1);
 }
-
 
 static void ShowHelp()
 {
@@ -165,7 +164,7 @@ if (string.IsNullOrWhiteSpace(command))
     return;
 }
 
-// Data dir (persisted, not bin/Debug)
+// Data dir (persisted)
 var dataDir = AppPaths.DataDir;
 Directory.CreateDirectory(dataDir);
 
@@ -183,11 +182,11 @@ if (command == "register-company")
     var tenantId = Guid.NewGuid().ToString();
     var createdAtUtc = ToIsoUtc(DateTime.UtcNow);
 
-    // tenants\<tenantId>\company.json
     var tenantDir = Path.Combine(dataDir, "tenants", tenantId);
     Directory.CreateDirectory(tenantDir);
 
     var companyFilePath = Path.Combine(tenantDir, "company.json");
+
     var companyInternal = new
     {
         tenantId,
@@ -198,10 +197,11 @@ if (command == "register-company")
         notes
     };
 
-    var companyJson = JsonSerializer.Serialize(companyInternal, new JsonSerializerOptions { WriteIndented = true });
-    File.WriteAllText(companyFilePath, companyJson, Encoding.UTF8);
+    File.WriteAllText(
+        companyFilePath,
+        JsonSerializer.Serialize(companyInternal, new JsonSerializerOptions { WriteIndented = true }),
+        Encoding.UTF8);
 
-    // CSV index (also in data dir via CsvStore)
     CsvStore.AppendTenant(new TenantRecord(
         TenantId: tenantId,
         CompanyName: companyName,
@@ -214,8 +214,6 @@ if (command == "register-company")
     Console.WriteLine();
     Console.WriteLine("✅ Company registered");
     Console.WriteLine($"TenantId : {tenantId}");
-    Console.WriteLine($"Company  : {companyFilePath}");
-    Console.WriteLine($"CSV      : {CsvStore.TenantsFilePath}");
     return;
 }
 
@@ -225,9 +223,8 @@ if (command == "register-company")
 
 if (command == "issue-license")
 {
-    // Load config (vault + key)
     var configuration = new ConfigurationBuilder()
-        .SetBasePath(AppContext.BaseDirectory) // appsettings.json sits beside the binary
+        .SetBasePath(AppContext.BaseDirectory)
         .AddJsonFile("appsettings.json", optional: false)
         .Build();
 
@@ -235,26 +232,21 @@ if (command == "issue-license")
     var keyName = configuration["KeyVault:KeyName"];
 
     if (string.IsNullOrWhiteSpace(vaultName) || string.IsNullOrWhiteSpace(keyName))
-        throw new InvalidOperationException("KeyVault configuration missing (KeyVault:Name / KeyVault:KeyName).");
+        throw new InvalidOperationException("KeyVault config missing.");
 
-    // Inputs
     var tenantId = Prompt("TenantId");
     var licenseType = Prompt("License type (pilot/paid)").ToLowerInvariant();
     var durationUnit = PromptDurationUnit();
-    var durationValue = PromptInt("Duration value", min: 1, max: 3650);
-    var maxEndpoints = PromptInt("Max endpoints", min: 1, max: 100000);
+    var durationValue = PromptInt("Duration value", 1, 3650);
+    var maxEndpoints = PromptInt("Max endpoints", 1, 100000);
 
-    var customWorkflows = PromptBool("Feature: customWorkflows (true/false)");
-    var adminEnabled = PromptBool("Feature: adminEnabled (true/false)");
+    var customWorkflows = PromptBool("Feature: customWorkflows (y = yes / n = no)");
+    var adminEnabled = PromptBool("Feature: adminEnabled (y = yes / n = no)");
 
-    // Generate + dates
     var licenseId = Guid.NewGuid().ToString();
     var issuedAtUtc = DateTime.UtcNow;
-
-    // End-of-day UTC expiry
     var expiryUtc = CalculateExpiryUtc(issuedAtUtc, durationUnit, durationValue);
 
-    // Signed payload (only trusted fields)
     var licensePayload = new
     {
         tenantId,
@@ -263,59 +255,45 @@ if (command == "issue-license")
         issuedAtUtc = ToIsoUtc(issuedAtUtc),
         expiryUtc = ToIsoUtc(expiryUtc),
         maxEndpoints,
-        features = new
-        {
-            customWorkflows,
-            adminEnabled
-        }
+        features = new { customWorkflows, adminEnabled }
     };
 
-    // Canonical JSON (stable ordering)
     var payloadJson = JsonSerializer.Serialize(licensePayload);
     using var payloadDoc = JsonDocument.Parse(payloadJson);
     var canonicalPayloadJson = CanonicalizeJson(payloadDoc.RootElement);
-    var dataToSign = Encoding.UTF8.GetBytes(canonicalPayloadJson);
 
-    // Sign via Key Vault
     var credential = new DefaultAzureCredential();
     var vaultUri = new Uri($"https://{vaultName}.vault.azure.net/");
     var keyClient = new KeyClient(vaultUri, credential);
-
     var key = await keyClient.GetKeyAsync(keyName);
-    var keyId = key.Value.Properties.Version;
-    if (string.IsNullOrWhiteSpace(keyId))
-        throw new InvalidOperationException("Key version was empty.");
 
+    var keyVersion = key.Value.Properties.Version!;
     var cryptoClient = new CryptographyClient(key.Value.Id, credential);
-    var signResult = await cryptoClient.SignDataAsync(SignatureAlgorithm.RS256, dataToSign);
-    var signatureB64 = Convert.ToBase64String(signResult.Signature);
+    var signature = await cryptoClient.SignDataAsync(
+        SignatureAlgorithm.RS256,
+        Encoding.UTF8.GetBytes(canonicalPayloadJson));
 
-    // Wrapper (not signed)
     var output = new
     {
         formatVersion = 1,
-        keyId,
+        keyId = keyVersion,
         license = JsonSerializer.Deserialize<JsonElement>(canonicalPayloadJson),
-        signature = signatureB64
+        signature = Convert.ToBase64String(signature.Signature)
     };
 
     var outputJson = JsonSerializer.Serialize(output, new JsonSerializerOptions { WriteIndented = true });
 
-    // Paths in persistent data dir:
-    // Internal archive:  C:\FixoraData\LicenseIssuer\tenants\<tenantId>\licenses\<licenseId>\<licenseId>.json
-    var tenantLicenseDir = Path.Combine(dataDir, "tenants", tenantId, "licenses", licenseId);
-    Directory.CreateDirectory(tenantLicenseDir);
-    var archiveFilePath = Path.Combine(tenantLicenseDir, $"{licenseId}.json");
-    File.WriteAllText(archiveFilePath, outputJson, Encoding.UTF8);
+    // Archive
+    var archiveDir = Path.Combine(dataDir, "tenants", tenantId, "licenses", licenseId);
+    Directory.CreateDirectory(archiveDir);
+    File.WriteAllText(Path.Combine(archiveDir, "fixora.license.json"), outputJson);
 
-    // Customer deliverable: C:\FixoraData\LicenseIssuer\out\<tenantId>\<licenseId>\fixora.license.json
-    var outDir = Path.Combine(dataDir, "out", tenantId, licenseId);
-    Directory.CreateDirectory(outDir);
-    var customerFilePath = Path.Combine(outDir, "fixora.license.json");
-    File.WriteAllText(customerFilePath, outputJson, Encoding.UTF8);
+    // Export (latest)
+    var exportDir = Path.Combine(dataDir, "tenants", tenantId, "exports");
+    Directory.CreateDirectory(exportDir);
+    var exportPath = Path.Combine(exportDir, "fixora.license.json");
+    File.WriteAllText(exportPath, outputJson);
 
-    // Record license issuance internally (CSV)
-    var featuresJson = JsonSerializer.Serialize(new { customWorkflows, adminEnabled });
     CsvStore.AppendLicense(new LicenseRecord(
         LicenseId: licenseId,
         TenantId: tenantId,
@@ -323,22 +301,17 @@ if (command == "issue-license")
         IssuedAtUtc: ToIsoUtc(issuedAtUtc),
         ExpiryUtc: ToIsoUtc(expiryUtc),
         MaxEndpoints: maxEndpoints.ToString(),
-        FeaturesJson: featuresJson,
-        OutputFile: customerFilePath,
-        KeyId: keyId
+        FeaturesJson: JsonSerializer.Serialize(new { customWorkflows, adminEnabled }),
+        OutputFile: exportPath,
+        KeyId: keyVersion
     ));
 
     Console.WriteLine();
     Console.WriteLine("✅ License issued");
     Console.WriteLine($"TenantId : {tenantId}");
     Console.WriteLine($"LicenseId: {licenseId}");
-    Console.WriteLine($"Expires  : {ToIsoUtc(expiryUtc)}");
-    Console.WriteLine($"Customer : {customerFilePath}");
-    Console.WriteLine($"Archive  : {archiveFilePath}");
-    Console.WriteLine($"CSV      : {CsvStore.LicensesFilePath}");
+    Console.WriteLine($"Export   : {exportPath}");
     return;
 }
-
-// ---------------------
 
 ShowHelp();
