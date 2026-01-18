@@ -1,0 +1,18 @@
+# ===== Build output =====
+bin/
+obj/
+
+# ===== Local configuration =====
+appsettings.json
+
+# ===== Local data (never commit) =====
+tenants/
+out/
+*.csv
+*.license.json
+
+# ===== OS / tooling =====
+.vs/
+.vscode/
+.DS_Store
+Thumbs.db
